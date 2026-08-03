@@ -68,7 +68,7 @@ Default amplitude is **0.2** so a tone is audible without blasting.
 - No TUI / headless / IPC (yet)
 - No spectrum analyzer, MIDI, or multi-voice synth
 
-## Smoke checklist
+## Checklist
 
 - [ ] `make` produces one `gk-oscillator` binary
 - [ ] Device lists populate; Refresh works
