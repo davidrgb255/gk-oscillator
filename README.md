@@ -81,3 +81,4 @@ Default amplitude is **0.2** so a tone is audible without blasting.
 ## License
 
 MIT — see [LICENSE](LICENSE).
+<img width="902" height="589" alt="gk-shot-20260803-195049" src="https://github.com/user-attachments/assets/cc35c03f-ebdb-491d-a6f6-d7bc81b328be" />
