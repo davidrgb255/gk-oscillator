@@ -5,6 +5,7 @@
 
 #include <math.h>
 #include <pthread.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -17,12 +18,26 @@
 #define GK_FRAMES       256
 #define GK_MAX_CH       2
 
+/*
+ * SPSC monitor FIFO: input callback produces, output callback consumes in order.
+ * Using free-running indices (power-of-two capacity) avoids the old "read latest
+ * window" path that re-played or skipped blocks when streams drifted.
+ */
+typedef struct gk_mon_fifo {
+    float *data;
+    uint32_t cap;   /* power of two */
+    uint32_t mask;
+    volatile uint32_t w; /* producer (input) */
+    volatile uint32_t r; /* consumer (output) */
+} gk_mon_fifo;
+
 struct gk_audio {
     int pa_ready;
     int running;
 
     PaStream *out_stream;
     PaStream *in_stream;
+    PaStream *duplex_stream; /* full-duplex when both ends open together */
 
     int in_dev;
     int out_dev;
@@ -46,9 +61,136 @@ struct gk_audio {
     gk_ringbuf ring_gen;
     gk_ringbuf ring_in;
 
+    /* Ordered monitor path (not the scope ring) */
+    gk_mon_fifo mon;
+    float mon_gain_smooth; /* de-click enable/disable and gain changes */
+    float mon_dc_x;        /* one-pole DC blocker state */
+    float mon_dc_y;
+    float mon_env;         /* soft underrun fade */
+
     unsigned long xruns;
     char last_error[256];
 };
+
+static uint32_t next_pow2_u32(uint32_t v)
+{
+    uint32_t p = 1;
+    if (v == 0) {
+        return 1;
+    }
+    while (p < v) {
+        p <<= 1;
+    }
+    return p;
+}
+
+static int mon_fifo_init(gk_mon_fifo *f, uint32_t min_cap)
+{
+    uint32_t cap = next_pow2_u32(min_cap < 1024 ? 1024 : min_cap);
+    memset(f, 0, sizeof(*f));
+    f->data = (float *)calloc(cap, sizeof(float));
+    if (f->data == NULL) {
+        return -1;
+    }
+    f->cap = cap;
+    f->mask = cap - 1;
+    f->w = 0;
+    f->r = 0;
+    return 0;
+}
+
+static void mon_fifo_free(gk_mon_fifo *f)
+{
+    if (f == NULL) {
+        return;
+    }
+    free(f->data);
+    memset(f, 0, sizeof(*f));
+}
+
+static void mon_fifo_reset(gk_mon_fifo *f)
+{
+    if (f == NULL || f->data == NULL) {
+        return;
+    }
+    f->w = 0;
+    f->r = 0;
+    memset(f->data, 0, f->cap * sizeof(float));
+}
+
+static uint32_t mon_fifo_avail(const gk_mon_fifo *f)
+{
+    return f->w - f->r;
+}
+
+/* Drop oldest samples so fill stays near target (low latency, fewer underruns). */
+static void mon_fifo_trim(gk_mon_fifo *f, uint32_t target, uint32_t high)
+{
+    uint32_t avail = mon_fifo_avail(f);
+    if (avail > high) {
+        f->r = f->w - target;
+    }
+}
+
+static void mon_fifo_write(gk_mon_fifo *f, const float *samples, uint32_t n)
+{
+    uint32_t i;
+    uint32_t w;
+    uint32_t r;
+    if (f == NULL || f->data == NULL || samples == NULL || n == 0) {
+        return;
+    }
+    w = f->w;
+    r = f->r;
+    for (i = 0; i < n; i++) {
+        /* Overrun: drop oldest so we never block the capture callback. */
+        if ((uint32_t)(w - r) >= f->cap - 1) {
+            r++;
+        }
+        f->data[w & f->mask] = samples[i];
+        w++;
+    }
+    f->r = r;
+    f->w = w;
+}
+
+/* Consume n samples in order. Underruns write 0 and return underrun count. */
+static uint32_t mon_fifo_read(gk_mon_fifo *f, float *out, uint32_t n)
+{
+    uint32_t i;
+    uint32_t w;
+    uint32_t r;
+    uint32_t underruns = 0;
+    if (f == NULL || f->data == NULL || out == NULL || n == 0) {
+        return n;
+    }
+    w = f->w;
+    r = f->r;
+    for (i = 0; i < n; i++) {
+        if (r != w) {
+            out[i] = f->data[r & f->mask];
+            r++;
+        } else {
+            out[i] = 0.0f;
+            underruns++;
+        }
+    }
+    f->r = r;
+    return underruns;
+}
+
+/* Soft clip keeps generator+monitor sums from hard-edge crackles. */
+static float soft_clip(float x)
+{
+    if (x > 1.2f) {
+        return 1.0f;
+    }
+    if (x < -1.2f) {
+        return -1.0f;
+    }
+    /* cubic soft knee: smooth near ±1 */
+    return x - (x * x * x) * (1.0f / 3.0f) * 0.35f;
+}
 
 const char *gk_wave_name(gk_wave w)
 {
@@ -126,34 +268,25 @@ static float osc_sample(gk_audio *a, float freq, float amp)
     return s * amp;
 }
 
-static int out_callback(const void *input, void *output,
-                        unsigned long frameCount,
-                        const PaStreamCallbackTimeInfo *timeInfo,
-                        PaStreamCallbackFlags statusFlags,
-                        void *userData)
+/* Render one output block; optional direct input for duplex (NULL = use FIFO). */
+static void render_out_block(gk_audio *a, float *out, unsigned long frameCount,
+                             const float *direct_in, int direct_in_ch)
 {
-    gk_audio *a = (gk_audio *)userData;
-    float *out = (float *)output;
     unsigned long i;
     float gen_buf[512];
     float mon_buf[512];
-    float freq, amp, mon_gain;
+    float freq, amp, mon_gain_target;
     int gen_on, mon_on, ch;
-    size_t mon_n = 0;
-
-    (void)input;
-    (void)timeInfo;
-
-    if (statusFlags & (paOutputUnderflow | paOutputOverflow | paInputUnderflow | paInputOverflow)) {
-        a->xruns++;
-    }
+    float smooth;
+    float coeff;
+    uint32_t underruns = 0;
 
     pthread_mutex_lock(&a->lock);
     freq = a->freq;
     amp = a->amp;
     gen_on = a->gen_enabled;
     mon_on = a->monitor;
-    mon_gain = a->monitor_gain;
+    mon_gain_target = mon_on ? a->monitor_gain : 0.0f;
     pthread_mutex_unlock(&a->lock);
 
     ch = a->out_channels;
@@ -165,31 +298,62 @@ static int out_callback(const void *input, void *output,
     }
 
     if (frameCount > 512) {
-        frameCount = 512; /* safety; PA should honor framesPerBuffer */
+        frameCount = 512;
     }
 
-    /* Latest input window for monitor (aligned as well as separate streams allow). */
-    if (mon_on) {
-        mon_n = gk_ringbuf_read_latest(&a->ring_in, mon_buf, (size_t)frameCount);
+    /* ~5 ms exponential ramp for monitor gain (avoids click on toggle). */
+    coeff = (a->sample_rate > 0.0)
+                ? (float)(1.0 - exp(-1.0 / (0.005 * a->sample_rate)))
+                : 0.05f;
+    if (coeff < 0.001f) {
+        coeff = 0.001f;
+    }
+    if (coeff > 0.5f) {
+        coeff = 0.5f;
     }
 
+    if (direct_in != NULL) {
+        /* Full-duplex: sample-accurate input, no FIFO. */
+        int ich = direct_in_ch > 0 ? direct_in_ch : 1;
+        for (i = 0; i < frameCount; i++) {
+            if (ich == 1) {
+                mon_buf[i] = direct_in[i];
+            } else {
+                mon_buf[i] = 0.5f * (direct_in[i * ich] + direct_in[i * ich + 1]);
+            }
+        }
+        a->mon_env = 1.0f;
+    } else {
+        underruns = mon_fifo_read(&a->mon, mon_buf, (uint32_t)frameCount);
+        if (underruns > 0) {
+            a->xruns++;
+            /* Fade only on real FIFO underruns, not quiet input. */
+            if (underruns > (uint32_t)frameCount / 4) {
+                a->mon_env *= 0.75f;
+            }
+        } else {
+            a->mon_env += (1.0f - a->mon_env) * 0.15f;
+        }
+        if (a->mon_env < 0.05f) {
+            a->mon_env = 0.05f;
+        }
+    }
+
+    smooth = a->mon_gain_smooth;
     for (i = 0; i < frameCount; i++) {
         float g = 0.0f;
         float mixed;
+        float mon;
+
         if (gen_on) {
             g = osc_sample(a, freq, amp);
         }
         gen_buf[i] = g;
-        mixed = g;
-        if (mon_on && mon_n > 0) {
-            size_t mi = (i < mon_n) ? i : (mon_n - 1);
-            mixed += mon_buf[mi] * mon_gain;
-        }
-        if (mixed > 1.0f) {
-            mixed = 1.0f;
-        } else if (mixed < -1.0f) {
-            mixed = -1.0f;
-        }
+
+        smooth += (mon_gain_target - smooth) * coeff;
+        mon = mon_buf[i] * smooth * a->mon_env;
+
+        mixed = soft_clip(g + mon);
         if (ch == 1) {
             out[i] = mixed;
         } else {
@@ -197,8 +361,74 @@ static int out_callback(const void *input, void *output,
             out[i * 2 + 1] = mixed;
         }
     }
+    a->mon_gain_smooth = smooth;
 
     gk_ringbuf_write(&a->ring_gen, gen_buf, (size_t)frameCount);
+}
+
+static int out_callback(const void *input, void *output,
+                        unsigned long frameCount,
+                        const PaStreamCallbackTimeInfo *timeInfo,
+                        PaStreamCallbackFlags statusFlags,
+                        void *userData)
+{
+    gk_audio *a = (gk_audio *)userData;
+    (void)input;
+    (void)timeInfo;
+
+    if (statusFlags & (paOutputUnderflow | paOutputOverflow)) {
+        a->xruns++;
+    }
+    render_out_block(a, (float *)output, frameCount, NULL, 0);
+    return paContinue;
+}
+
+static int duplex_callback(const void *input, void *output,
+                           unsigned long frameCount,
+                           const PaStreamCallbackTimeInfo *timeInfo,
+                           PaStreamCallbackFlags statusFlags,
+                           void *userData)
+{
+    gk_audio *a = (gk_audio *)userData;
+    const float *in = (const float *)input;
+    float mono[512];
+    unsigned long i;
+    int ch = a->in_channels;
+
+    (void)timeInfo;
+
+    if (statusFlags & (paOutputUnderflow | paOutputOverflow | paInputUnderflow | paInputOverflow)) {
+        a->xruns++;
+    }
+
+    if (frameCount > 512) {
+        frameCount = 512;
+    }
+    if (ch < 1) {
+        ch = 1;
+    }
+
+    /* Scope ring + DC-blocked mono (duplex still feeds scope from capture). */
+    if (in != NULL) {
+        for (i = 0; i < frameCount; i++) {
+            float x, y;
+            if (ch == 1) {
+                x = in[i];
+            } else {
+                x = 0.5f * (in[i * ch] + in[i * ch + 1]);
+            }
+            /* R = 0.995 @ 48 kHz-ish high-pass */
+            y = x - a->mon_dc_x + 0.995f * a->mon_dc_y;
+            a->mon_dc_x = x;
+            a->mon_dc_y = y;
+            mono[i] = y;
+        }
+        gk_ringbuf_write(&a->ring_in, mono, (size_t)frameCount);
+        render_out_block(a, (float *)output, frameCount, mono, 1);
+    } else {
+        memset(mono, 0, (size_t)frameCount * sizeof(float));
+        render_out_block(a, (float *)output, frameCount, mono, 1);
+    }
     return paContinue;
 }
 
@@ -213,6 +443,8 @@ static int in_callback(const void *input, void *output,
     float mono[512];
     unsigned long i;
     int ch = a->in_channels;
+    uint32_t target;
+    uint32_t high;
 
     (void)output;
     (void)timeInfo;
@@ -230,14 +462,32 @@ static int in_callback(const void *input, void *output,
         ch = 1;
     }
 
+    memset(mono, 0, sizeof(mono));
     for (i = 0; i < frameCount; i++) {
+        float x, y;
         if (ch == 1) {
-            mono[i] = in[i];
+            x = in[i];
         } else {
-            mono[i] = 0.5f * (in[i * ch] + in[i * ch + 1]);
+            x = 0.5f * (in[i * ch] + in[i * ch + 1]);
         }
+        y = x - a->mon_dc_x + 0.995f * a->mon_dc_y;
+        a->mon_dc_x = x;
+        a->mon_dc_y = y;
+        mono[i] = y;
     }
     gk_ringbuf_write(&a->ring_in, mono, (size_t)frameCount);
+    mon_fifo_write(&a->mon, mono, (uint32_t)frameCount);
+
+    /* Keep ~2–4 buffers of slack so separate clocks rarely underrun. */
+    target = (uint32_t)(a->frames_per_buffer * 2);
+    high = (uint32_t)(a->frames_per_buffer * 5);
+    if (target < 128) {
+        target = 128;
+    }
+    if (high < target + 64) {
+        high = target + 64;
+    }
+    mon_fifo_trim(&a->mon, target, high);
     return paContinue;
 }
 
@@ -254,6 +504,8 @@ gk_audio *gk_audio_create(void)
     a->gen_enabled = 1;
     a->monitor = 0;
     a->monitor_gain = 0.35f;
+    a->mon_gain_smooth = 0.0f;
+    a->mon_env = 1.0f;
     a->noise_state = 0xA341316Cu;
     a->sample_rate = 48000.0;
     a->frames_per_buffer = GK_FRAMES;
@@ -271,6 +523,7 @@ void gk_audio_destroy(gk_audio *a)
     gk_audio_shutdown(a);
     gk_ringbuf_free(&a->ring_gen);
     gk_ringbuf_free(&a->ring_in);
+    mon_fifo_free(&a->mon);
     pthread_mutex_destroy(&a->lock);
     free(a);
 }
@@ -404,6 +657,10 @@ int gk_audio_start(gk_audio *a, int in_dev, int out_dev, double sample_rate)
     a->xruns = 0;
     a->in_dev = in_dev;
     a->out_dev = out_dev;
+    a->mon_gain_smooth = 0.0f;
+    a->mon_env = 1.0f;
+    a->mon_dc_x = 0.0f;
+    a->mon_dc_y = 0.0f;
 
     ring_cap = (size_t)(sr * GK_RING_SECONDS);
     if (ring_cap < 1024) {
@@ -411,11 +668,17 @@ int gk_audio_start(gk_audio *a, int in_dev, int out_dev, double sample_rate)
     }
     gk_ringbuf_free(&a->ring_gen);
     gk_ringbuf_free(&a->ring_in);
+    mon_fifo_free(&a->mon);
     if (gk_ringbuf_init(&a->ring_gen, ring_cap) != 0 ||
-        gk_ringbuf_init(&a->ring_in, ring_cap) != 0) {
+        gk_ringbuf_init(&a->ring_in, ring_cap) != 0 ||
+        mon_fifo_init(&a->mon, (uint32_t)(sr * 0.25) /* 250 ms max lag */) != 0) {
         set_error(a, "Ring buffer alloc failed");
+        gk_ringbuf_free(&a->ring_gen);
+        gk_ringbuf_free(&a->ring_in);
+        mon_fifo_free(&a->mon);
         return -1;
     }
+    mon_fifo_reset(&a->mon);
 
     memset(&in_params, 0, sizeof(in_params));
     memset(&out_params, 0, sizeof(out_params));
@@ -430,7 +693,13 @@ int gk_audio_start(gk_audio *a, int in_dev, int out_dev, double sample_rate)
         out_params.device = out_dev;
         out_params.channelCount = a->out_channels;
         out_params.sampleFormat = paFloat32;
-        out_params.suggestedLatency = di->defaultLowOutputLatency;
+        /* Slightly higher latency than "low" reduces separate-stream xruns. */
+        out_params.suggestedLatency = di->defaultHighOutputLatency > 0
+                                          ? di->defaultHighOutputLatency * 0.5
+                                          : di->defaultLowOutputLatency;
+        if (out_params.suggestedLatency < di->defaultLowOutputLatency) {
+            out_params.suggestedLatency = di->defaultLowOutputLatency;
+        }
         out_params.hostApiSpecificStreamInfo = NULL;
         out_ptr = &out_params;
     } else {
@@ -447,64 +716,105 @@ int gk_audio_start(gk_audio *a, int in_dev, int out_dev, double sample_rate)
         in_params.device = in_dev;
         in_params.channelCount = a->in_channels;
         in_params.sampleFormat = paFloat32;
-        in_params.suggestedLatency = di->defaultLowInputLatency;
+        in_params.suggestedLatency = di->defaultHighInputLatency > 0
+                                         ? di->defaultHighInputLatency * 0.5
+                                         : di->defaultLowInputLatency;
+        if (in_params.suggestedLatency < di->defaultLowInputLatency) {
+            in_params.suggestedLatency = di->defaultLowInputLatency;
+        }
         in_params.hostApiSpecificStreamInfo = NULL;
         in_ptr = &in_params;
     } else {
         a->in_channels = 0;
     }
 
-    /* Prefer separate streams so input/output can be different devices. */
-    if (out_ptr) {
-        err = Pa_OpenStream(&a->out_stream,
-                            NULL,
+    a->out_stream = NULL;
+    a->in_stream = NULL;
+    a->duplex_stream = NULL;
+
+    /*
+     * Prefer full-duplex when both devices are set: sample-accurate monitor,
+     * no FIFO jitter. Fall back to separate streams for mixed devices/hosts.
+     */
+    if (in_ptr && out_ptr) {
+        err = Pa_OpenStream(&a->duplex_stream,
+                            in_ptr,
                             out_ptr,
                             sr,
                             (unsigned long)a->frames_per_buffer,
                             paClipOff,
-                            out_callback,
+                            duplex_callback,
                             a);
         if (err != paNoError) {
-            set_pa_error(a, "Open output", err);
-            a->out_stream = NULL;
-            return -1;
+            a->duplex_stream = NULL;
+            /* fall through to separate streams */
         }
     }
 
-    if (in_ptr) {
-        err = Pa_OpenStream(&a->in_stream,
-                            in_ptr,
-                            NULL,
-                            sr,
-                            (unsigned long)a->frames_per_buffer,
-                            paClipOff,
-                            in_callback,
-                            a);
-        if (err != paNoError) {
-            set_pa_error(a, "Open input", err);
-            if (a->out_stream) {
-                Pa_CloseStream(a->out_stream);
+    if (!a->duplex_stream) {
+        if (out_ptr) {
+            err = Pa_OpenStream(&a->out_stream,
+                                NULL,
+                                out_ptr,
+                                sr,
+                                (unsigned long)a->frames_per_buffer,
+                                paClipOff,
+                                out_callback,
+                                a);
+            if (err != paNoError) {
+                set_pa_error(a, "Open output", err);
                 a->out_stream = NULL;
+                return -1;
             }
-            a->in_stream = NULL;
-            return -1;
+        }
+
+        if (in_ptr) {
+            err = Pa_OpenStream(&a->in_stream,
+                                in_ptr,
+                                NULL,
+                                sr,
+                                (unsigned long)a->frames_per_buffer,
+                                paClipOff,
+                                in_callback,
+                                a);
+            if (err != paNoError) {
+                set_pa_error(a, "Open input", err);
+                if (a->out_stream) {
+                    Pa_CloseStream(a->out_stream);
+                    a->out_stream = NULL;
+                }
+                a->in_stream = NULL;
+                return -1;
+            }
         }
     }
 
-    if (a->out_stream) {
-        err = Pa_StartStream(a->out_stream);
+    if (a->duplex_stream) {
+        err = Pa_StartStream(a->duplex_stream);
         if (err != paNoError) {
-            set_pa_error(a, "Start output", err);
+            set_pa_error(a, "Start duplex", err);
             gk_audio_stop(a);
             return -1;
         }
-    }
-    if (a->in_stream) {
-        err = Pa_StartStream(a->in_stream);
-        if (err != paNoError) {
-            set_pa_error(a, "Start input", err);
-            gk_audio_stop(a);
-            return -1;
+    } else {
+        /* Start capture first so the monitor FIFO has samples before playback. */
+        if (a->in_stream) {
+            err = Pa_StartStream(a->in_stream);
+            if (err != paNoError) {
+                set_pa_error(a, "Start input", err);
+                gk_audio_stop(a);
+                return -1;
+            }
+            /* Prime FIFO with a couple of silent buffers worth of headroom via wait */
+            Pa_Sleep(8);
+        }
+        if (a->out_stream) {
+            err = Pa_StartStream(a->out_stream);
+            if (err != paNoError) {
+                set_pa_error(a, "Start output", err);
+                gk_audio_stop(a);
+                return -1;
+            }
         }
     }
 
@@ -518,6 +828,11 @@ int gk_audio_stop(gk_audio *a)
     if (a == NULL) {
         return -1;
     }
+    if (a->duplex_stream) {
+        Pa_StopStream(a->duplex_stream);
+        Pa_CloseStream(a->duplex_stream);
+        a->duplex_stream = NULL;
+    }
     if (a->out_stream) {
         Pa_StopStream(a->out_stream);
         Pa_CloseStream(a->out_stream);
@@ -528,6 +843,7 @@ int gk_audio_stop(gk_audio *a)
         Pa_CloseStream(a->in_stream);
         a->in_stream = NULL;
     }
+    mon_fifo_reset(&a->mon);
     a->running = 0;
     return 0;
 }

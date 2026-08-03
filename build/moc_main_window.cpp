@@ -53,6 +53,7 @@ static constexpr auto qt_meta_stringdata_ZN10MainWindowE = QtMocHelpers::stringD
     "onTimebaseChanged",
     "onGainChanged",
     "onFreezeToggled",
+    "onToggleFullscreen",
     "tick"
 );
 #else  // !QT_MOC_HAS_STRINGDATA
@@ -65,7 +66,7 @@ Q_CONSTINIT static const uint qt_meta_data_ZN10MainWindowE[] = {
       12,       // revision
        0,       // classname
        0,    0, // classinfo
-      12,   14, // methods
+      13,   14, // methods
        0,    0, // properties
        0,    0, // enums/sets
        0,    0, // constructors
@@ -73,18 +74,19 @@ Q_CONSTINIT static const uint qt_meta_data_ZN10MainWindowE[] = {
        0,       // signalCount
 
  // slots: name, argc, parameters, tag, flags, initial metatype offsets
-       1,    0,   86,    2, 0x08,    1 /* Private */,
-       3,    0,   87,    2, 0x08,    2 /* Private */,
-       4,    1,   88,    2, 0x08,    3 /* Private */,
-       6,    1,   91,    2, 0x08,    5 /* Private */,
-       8,    1,   94,    2, 0x08,    7 /* Private */,
-       9,    1,   97,    2, 0x08,    9 /* Private */,
-      11,    1,  100,    2, 0x08,   11 /* Private */,
-      12,    1,  103,    2, 0x08,   13 /* Private */,
-      13,    1,  106,    2, 0x08,   15 /* Private */,
-      14,    1,  109,    2, 0x08,   17 /* Private */,
-      15,    1,  112,    2, 0x08,   19 /* Private */,
-      16,    0,  115,    2, 0x08,   21 /* Private */,
+       1,    0,   92,    2, 0x08,    1 /* Private */,
+       3,    0,   93,    2, 0x08,    2 /* Private */,
+       4,    1,   94,    2, 0x08,    3 /* Private */,
+       6,    1,   97,    2, 0x08,    5 /* Private */,
+       8,    1,  100,    2, 0x08,    7 /* Private */,
+       9,    1,  103,    2, 0x08,    9 /* Private */,
+      11,    1,  106,    2, 0x08,   11 /* Private */,
+      12,    1,  109,    2, 0x08,   13 /* Private */,
+      13,    1,  112,    2, 0x08,   15 /* Private */,
+      14,    1,  115,    2, 0x08,   17 /* Private */,
+      15,    1,  118,    2, 0x08,   19 /* Private */,
+      16,    0,  121,    2, 0x08,   21 /* Private */,
+      17,    0,  122,    2, 0x08,   22 /* Private */,
 
  // slots: parameters
     QMetaType::Void,
@@ -98,6 +100,7 @@ Q_CONSTINIT static const uint qt_meta_data_ZN10MainWindowE[] = {
     QMetaType::Void, QMetaType::Int,    5,
     QMetaType::Void, QMetaType::Int,    5,
     QMetaType::Void, QMetaType::Bool,   10,
+    QMetaType::Void,
     QMetaType::Void,
 
        0        // eod
@@ -143,6 +146,8 @@ Q_CONSTINIT const QMetaObject MainWindow::staticMetaObject = { {
         // method 'onFreezeToggled'
         QtPrivate::TypeAndForceComplete<void, std::false_type>,
         QtPrivate::TypeAndForceComplete<bool, std::false_type>,
+        // method 'onToggleFullscreen'
+        QtPrivate::TypeAndForceComplete<void, std::false_type>,
         // method 'tick'
         QtPrivate::TypeAndForceComplete<void, std::false_type>
     >,
@@ -165,7 +170,8 @@ void MainWindow::qt_static_metacall(QObject *_o, QMetaObject::Call _c, int _id, 
         case 8: _t->onTimebaseChanged((*reinterpret_cast< std::add_pointer_t<int>>(_a[1]))); break;
         case 9: _t->onGainChanged((*reinterpret_cast< std::add_pointer_t<int>>(_a[1]))); break;
         case 10: _t->onFreezeToggled((*reinterpret_cast< std::add_pointer_t<bool>>(_a[1]))); break;
-        case 11: _t->tick(); break;
+        case 11: _t->onToggleFullscreen(); break;
+        case 12: _t->tick(); break;
         default: ;
         }
     }
@@ -190,14 +196,14 @@ int MainWindow::qt_metacall(QMetaObject::Call _c, int _id, void **_a)
     if (_id < 0)
         return _id;
     if (_c == QMetaObject::InvokeMetaMethod) {
-        if (_id < 12)
+        if (_id < 13)
             qt_static_metacall(this, _c, _id, _a);
-        _id -= 12;
+        _id -= 13;
     }
     if (_c == QMetaObject::RegisterMethodArgumentMetaType) {
-        if (_id < 12)
+        if (_id < 13)
             *reinterpret_cast<QMetaType *>(_a[0]) = QMetaType();
-        _id -= 12;
+        _id -= 13;
     }
     return _id;
 }

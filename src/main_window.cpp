@@ -5,11 +5,16 @@
 #include <QCloseEvent>
 #include <QComboBox>
 #include <QDoubleSpinBox>
+#include <QEvent>
 #include <QGridLayout>
 #include <QGroupBox>
 #include <QHBoxLayout>
+#include <QKeyEvent>
+#include <QKeySequence>
 #include <QLabel>
+#include <QLayout>
 #include <QPushButton>
+#include <QShortcut>
 #include <QSlider>
 #include <QStatusBar>
 #include <QStyle>
@@ -24,6 +29,8 @@
 MainWindow::MainWindow(gk_audio *audio, QWidget *parent)
     : QMainWindow(parent)
     , m_audio(audio)
+    , m_scopeFullscreen(false)
+    , m_savedMaximized(false)
 {
     gk_config_load(&m_cfg);
     setWindowTitle(QStringLiteral("GK Oscillator"));
@@ -37,33 +44,38 @@ MainWindow::MainWindow(gk_audio *audio, QWidget *parent)
 
     m_scope = new ScopeWidget(central);
     m_scope->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
+    m_scope->setFocusPolicy(Qt::StrongFocus);
     root->addWidget(m_scope, 1);
 
-    /* Device row */
-    auto *devRow = new QHBoxLayout();
-    m_inCombo = new QComboBox(central);
-    m_outCombo = new QComboBox(central);
+    /* Device row (panel so it can be hidden in scope fullscreen) */
+    m_devPanel = new QWidget(central);
+    auto *devRow = new QHBoxLayout(m_devPanel);
+    devRow->setContentsMargins(0, 0, 0, 0);
+    m_inCombo = new QComboBox(m_devPanel);
+    m_outCombo = new QComboBox(m_devPanel);
     m_inCombo->setMinimumWidth(220);
     m_outCombo->setMinimumWidth(220);
-    m_refreshBtn = new QPushButton(QStringLiteral("Refresh"), central);
-    m_startBtn = new QPushButton(QStringLiteral("Start"), central);
+    m_refreshBtn = new QPushButton(QStringLiteral("Refresh"), m_devPanel);
+    m_startBtn = new QPushButton(QStringLiteral("Start"), m_devPanel);
     m_startBtn->setMinimumWidth(88);
 
-    auto *inLab = new QLabel(QStringLiteral("Input"), central);
-    auto *outLab = new QLabel(QStringLiteral("Output"), central);
+    auto *inLab = new QLabel(QStringLiteral("Input"), m_devPanel);
+    auto *outLab = new QLabel(QStringLiteral("Output"), m_devPanel);
     devRow->addWidget(inLab);
     devRow->addWidget(m_inCombo, 1);
     devRow->addWidget(outLab);
     devRow->addWidget(m_outCombo, 1);
     devRow->addWidget(m_refreshBtn);
     devRow->addWidget(m_startBtn);
-    root->addLayout(devRow);
+    root->addWidget(m_devPanel);
 
     /* Oscillator + scope controls */
-    auto *ctrl = new QHBoxLayout();
+    m_ctrlPanel = new QWidget(central);
+    auto *ctrl = new QHBoxLayout(m_ctrlPanel);
+    ctrl->setContentsMargins(0, 0, 0, 0);
     ctrl->setSpacing(16);
 
-    auto *oscBox = new QGroupBox(QStringLiteral("Oscillator"), central);
+    auto *oscBox = new QGroupBox(QStringLiteral("Oscillator"), m_ctrlPanel);
     auto *oscLay = new QGridLayout(oscBox);
     m_waveCombo = new QComboBox(oscBox);
     for (int w = 0; w < GK_WAVE_COUNT; ++w) {
@@ -90,7 +102,7 @@ MainWindow::MainWindow(gk_audio *audio, QWidget *parent)
     oscLay->addWidget(m_genCheck, 3, 0, 1, 3);
     oscLay->addWidget(m_monitorCheck, 4, 0, 1, 3);
 
-    auto *scopeBox = new QGroupBox(QStringLiteral("Display"), central);
+    auto *scopeBox = new QGroupBox(QStringLiteral("Display"), m_ctrlPanel);
     auto *scopeLay = new QGridLayout(scopeBox);
     m_sourceCombo = new QComboBox(scopeBox);
     m_sourceCombo->addItem(QStringLiteral("Generator"), (int)GK_SRC_GEN);
@@ -107,6 +119,8 @@ MainWindow::MainWindow(gk_audio *audio, QWidget *parent)
         m_gainCombo->addItem(QStringLiteral("×%1").arg(g), g);
     }
     m_freezeCheck = new QCheckBox(QStringLiteral("Freeze"), scopeBox);
+    m_fullscreenBtn = new QPushButton(QStringLiteral("Fullscreen"), scopeBox);
+    m_fullscreenBtn->setToolTip(QStringLiteral("Show wave full screen (Esc to exit)"));
 
     scopeLay->addWidget(new QLabel(QStringLiteral("Source"), scopeBox), 0, 0);
     scopeLay->addWidget(m_sourceCombo, 0, 1);
@@ -115,10 +129,11 @@ MainWindow::MainWindow(gk_audio *audio, QWidget *parent)
     scopeLay->addWidget(new QLabel(QStringLiteral("Gain"), scopeBox), 2, 0);
     scopeLay->addWidget(m_gainCombo, 2, 1);
     scopeLay->addWidget(m_freezeCheck, 3, 0, 1, 2);
+    scopeLay->addWidget(m_fullscreenBtn, 4, 0, 1, 2);
 
     ctrl->addWidget(oscBox, 1);
     ctrl->addWidget(scopeBox, 1);
-    root->addLayout(ctrl);
+    root->addWidget(m_ctrlPanel);
 
     m_status = new QLabel(central);
     m_status->setWordWrap(true);
@@ -153,6 +168,16 @@ MainWindow::MainWindow(gk_audio *audio, QWidget *parent)
     connect(m_gainCombo, QOverload<int>::of(&QComboBox::currentIndexChanged),
             this, &MainWindow::onGainChanged);
     connect(m_freezeCheck, &QCheckBox::toggled, this, &MainWindow::onFreezeToggled);
+    connect(m_fullscreenBtn, &QPushButton::clicked, this, &MainWindow::onToggleFullscreen);
+
+    /* Esc exits scope fullscreen even if focus is on a child widget */
+    auto *esc = new QShortcut(QKeySequence(Qt::Key_Escape), this);
+    esc->setContext(Qt::ApplicationShortcut);
+    connect(esc, &QShortcut::activated, this, [this]() {
+        if (m_scopeFullscreen) {
+            exitScopeFullscreen();
+        }
+    });
 
     m_timer = new QTimer(this);
     connect(m_timer, &QTimer::timeout, this, &MainWindow::tick);
@@ -164,7 +189,7 @@ MainWindow::MainWindow(gk_audio *audio, QWidget *parent)
     onAmpSlider(m_ampSlider->value());
     onGenToggled(m_genCheck->isChecked());
     onMonitorToggled(m_monitorCheck->isChecked());
-    onSourceChanged(m_sourceCombo->currentIndex());
+    updateScopeLabel();
     onTimebaseChanged(m_timebaseCombo->currentIndex());
     onGainChanged(m_gainCombo->currentIndex());
 
@@ -241,10 +266,18 @@ void MainWindow::collectConfig(gk_config *c) const
         return;
     }
     *c = m_cfg;
-    c->win_x = x();
-    c->win_y = y();
-    c->win_w = width();
-    c->win_h = height();
+    /* Prefer windowed geometry so fullscreen size is not restored next launch */
+    if (m_scopeFullscreen && m_savedGeometry.isValid()) {
+        c->win_x = m_savedGeometry.x();
+        c->win_y = m_savedGeometry.y();
+        c->win_w = m_savedGeometry.width();
+        c->win_h = m_savedGeometry.height();
+    } else {
+        c->win_x = x();
+        c->win_y = y();
+        c->win_w = width();
+        c->win_h = height();
+    }
     c->has_geometry = 1;
     c->wave = m_waveCombo->currentData().toInt();
     c->freq = (float)m_freqSpin->value();
@@ -396,6 +429,11 @@ void MainWindow::onMonitorToggled(bool on)
 void MainWindow::onSourceChanged(int index)
 {
     (void)index;
+    updateScopeLabel();
+}
+
+void MainWindow::updateScopeLabel()
+{
     const int src = m_sourceCombo->currentData().toInt();
     QString label = QStringLiteral("SCOPE · ");
     if (src == GK_SRC_GEN) {
@@ -405,7 +443,72 @@ void MainWindow::onSourceChanged(int index)
     } else {
         label += QStringLiteral("Mix");
     }
+    if (m_scopeFullscreen) {
+        label += QStringLiteral("  ·  Esc to exit");
+    }
     m_scope->setTraceLabel(label);
+}
+
+void MainWindow::setChromeVisible(bool visible)
+{
+    if (m_devPanel) {
+        m_devPanel->setVisible(visible);
+    }
+    if (m_ctrlPanel) {
+        m_ctrlPanel->setVisible(visible);
+    }
+    if (statusBar()) {
+        statusBar()->setVisible(visible);
+    }
+    auto *central = centralWidget();
+    if (central && central->layout()) {
+        if (visible) {
+            central->layout()->setContentsMargins(12, 12, 12, 8);
+        } else {
+            central->layout()->setContentsMargins(0, 0, 0, 0);
+        }
+    }
+}
+
+void MainWindow::enterScopeFullscreen()
+{
+    if (m_scopeFullscreen) {
+        return;
+    }
+    m_scopeFullscreen = true;
+    m_savedMaximized = isMaximized();
+    m_savedGeometry = normalGeometry().isValid() ? normalGeometry() : geometry();
+    setChromeVisible(false);
+    m_fullscreenBtn->setText(QStringLiteral("Exit full"));
+    showFullScreen();
+    m_scope->setFocus(Qt::OtherFocusReason);
+    updateScopeLabel();
+}
+
+void MainWindow::exitScopeFullscreen()
+{
+    if (!m_scopeFullscreen) {
+        return;
+    }
+    m_scopeFullscreen = false;
+    showNormal();
+    if (m_savedMaximized) {
+        showMaximized();
+    } else if (m_savedGeometry.isValid()) {
+        setGeometry(m_savedGeometry);
+    }
+    setChromeVisible(true);
+    m_fullscreenBtn->setText(QStringLiteral("Fullscreen"));
+    updateScopeLabel();
+}
+
+void MainWindow::onToggleFullscreen()
+{
+    if (m_scopeFullscreen) {
+        exitScopeFullscreen();
+    } else {
+        enterScopeFullscreen();
+    }
 }
 
 void MainWindow::onTimebaseChanged(int index)
@@ -478,8 +581,39 @@ void MainWindow::tick()
     }
 }
 
+void MainWindow::keyPressEvent(QKeyEvent *event)
+{
+    if (event->key() == Qt::Key_Escape && m_scopeFullscreen) {
+        exitScopeFullscreen();
+        event->accept();
+        return;
+    }
+    if (event->key() == Qt::Key_F11) {
+        onToggleFullscreen();
+        event->accept();
+        return;
+    }
+    QMainWindow::keyPressEvent(event);
+}
+
+void MainWindow::changeEvent(QEvent *event)
+{
+    QMainWindow::changeEvent(event);
+    /* Window manager may leave fullscreen (e.g. super+d); restore chrome */
+    if (event->type() == QEvent::WindowStateChange && m_scopeFullscreen
+        && !isFullScreen()) {
+        m_scopeFullscreen = false;
+        setChromeVisible(true);
+        m_fullscreenBtn->setText(QStringLiteral("Fullscreen"));
+        updateScopeLabel();
+    }
+}
+
 void MainWindow::closeEvent(QCloseEvent *event)
 {
+    if (m_scopeFullscreen) {
+        exitScopeFullscreen();
+    }
     gk_config c;
     collectConfig(&c);
     gk_config_save(&c);
