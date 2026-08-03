@@ -1,9 +1,10 @@
 [Desktop Entry]
 Type=Application
-Name=gk-oscillator
+Name=GK Oscillator
 Comment=Graphic oscillator with selectable sound I/O
 Exec=gk-oscillator
-Icon=applications-multimedia
+Icon=gk-oscillator
 Terminal=false
 Categories=AudioVideo;Audio;
 StartupNotify=true
+StartupWMClass=gk-oscillator

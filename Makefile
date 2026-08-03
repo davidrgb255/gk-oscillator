@@ -76,13 +76,26 @@ install-user: gk-oscillator
 	install -d $(USER_PREFIX)/share/applications
 	sed 's|^Exec=.*|Exec=$(USER_PREFIX)/bin/gk-oscillator|' packaging/gk-oscillator.desktop \
 	  > $(USER_PREFIX)/share/applications/gk-oscillator.desktop
+	@for sz in 16 22 24 32 48 64 128 256; do \
+	  install -d $(USER_PREFIX)/share/icons/hicolor/$${sz}x$${sz}/apps; \
+	  if [ -f assets/icons/gk-oscillator-$${sz}.png ]; then \
+	    install -m 644 assets/icons/gk-oscillator-$${sz}.png \
+	      $(USER_PREFIX)/share/icons/hicolor/$${sz}x$${sz}/apps/gk-oscillator.png; \
+	  fi; \
+	done
+	install -d $(USER_PREFIX)/share/icons/hicolor/256x256/apps
+	install -m 644 assets/icons/gk-oscillator.png \
+	  $(USER_PREFIX)/share/icons/hicolor/256x256/apps/gk-oscillator.png
 	@echo "Installed to $(USER_PREFIX)/bin/gk-oscillator"
 
 uninstall-user:
 	rm -f $(USER_PREFIX)/bin/gk-oscillator
 	rm -f $(USER_PREFIX)/share/applications/gk-oscillator.desktop
+	@for sz in 16 22 24 32 48 64 128 256; do \
+	  rm -f $(USER_PREFIX)/share/icons/hicolor/$${sz}x$${sz}/apps/gk-oscillator.png; \
+	done
 
 desktop-local: gk-oscillator
-	sed "s|^Exec=.*|Exec=$(CURDIR)/gk-oscillator|; s|^Icon=.*|Icon=applications-multimedia|" \
+	sed "s|^Exec=.*|Exec=$(CURDIR)/gk-oscillator|; s|^Icon=.*|Icon=$(CURDIR)/assets/icons/gk-oscillator.png|" \
 	  packaging/gk-oscillator.desktop > gk-oscillator.desktop
 	@echo "Wrote ./gk-oscillator.desktop"

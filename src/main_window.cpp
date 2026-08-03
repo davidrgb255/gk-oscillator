@@ -26,7 +26,7 @@ MainWindow::MainWindow(gk_audio *audio, QWidget *parent)
     , m_audio(audio)
 {
     gk_config_load(&m_cfg);
-    setWindowTitle(QStringLiteral("gk-oscillator"));
+    setWindowTitle(QStringLiteral("GK Oscillator"));
     applyDarkTheme();
 
     auto *central = new QWidget(this);
