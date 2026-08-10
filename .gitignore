@@ -1,0 +1,37 @@
+# Build tree and linked binary (make / make clean)
+/build/
+/gk-oscillator
+/gk-oscillator.desktop
+
+# Object / library junk (if built outside build/)
+*.o
+*.a
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+*.AppImage
+
+# Qt moc / rcc / uic (if generated outside build/)
+moc_*.cpp
+moc_*.h
+qrc_*.cpp
+ui_*.h
+
+# IDE / editor
+.idea/
+.vscode/
+*.user
+*.autosave
+.cache/
+.clangd/
+.qtc_clangd/
+compile_commands.json
+
+# OS
+.DS_Store
+Thumbs.db
+*~
+*.swp
+*.swo
